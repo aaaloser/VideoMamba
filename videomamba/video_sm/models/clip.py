@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 
-MODEL_PATH = 'your_model_path/clip_visual_encoder'
+MODEL_PATH = '/data/liyifan24/VideoMamba/pretrain_model/clip'
 _MODELS = {
     # extracted from OpenAI, see extract_clip
     "ViT-B/16": os.path.join(MODEL_PATH, "vit_b16.pth"),

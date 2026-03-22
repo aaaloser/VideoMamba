@@ -4,11 +4,11 @@ export OMP_NUM_THREADS=1
 JOB_NAME='videomamba_middle_mask_ft_f8_res224'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
-PREFIX='your_k400_path'
+PREFIX='/data/liyifan24/Datasets/Kinetics-400/'
 DATA_PATH='your_k400_metadata_path'
 
 PARTITION='video5'
-GPUS=16
+GPUS=4
 GPUS_PER_NODE=8
 CPUS_PER_TASK=16
 
@@ -21,7 +21,7 @@ srun -p $PARTITION \
         --kill-on-bad-exit=1 \
         python run_class_finetuning.py \
         --model videomamba_middle \
-        --finetune your_model_path/videomamba_m16_k400_mask_pt_f8_res224.pth \
+        --finetune /data/liyifan24/VideoMamba/pretrain_model/videomamba_m16_k400_mask_ft_f16_res224.pth \
         --data_path ${DATA_PATH} \
         --prefix ${PREFIX} \
         --data_set 'Kinetics_sparse' \
