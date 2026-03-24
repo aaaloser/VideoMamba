@@ -28,6 +28,36 @@ def quant_dequant_symmetric(
     return q * scale
 
 
+def quantize_symmetric_to_int(
+    x: torch.Tensor,
+    bits: int,
+    per_channel: bool = False,
+    channel_dim: int = 0,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Quantize float tensor to integer codes with symmetric scaling.
+
+    Returns:
+        q_int: int8 tensor containing integer codes.
+        scale: tensor scale (scalar or per-channel with keepdim layout).
+        qmin: minimum integer code.
+        qmax: maximum integer code.
+    """
+    bits = max(2, int(bits))
+    qmax = int((1 << (bits - 1)) - 1)
+    qmin = -qmax - 1
+
+    if per_channel and x.ndim > 1:
+        reduce_dims = [d for d in range(x.ndim) if d != channel_dim]
+        scale = x.detach().abs().amax(dim=reduce_dims, keepdim=True) / float(qmax)
+    else:
+        scale = x.detach().abs().amax() / float(qmax)
+
+    scale = torch.clamp(scale, min=eps)
+    q = torch.clamp(torch.round(x / scale), qmin, qmax).to(torch.int8)
+    return q, scale, qmin, qmax
+
+
 def resolve_block_bit(block_bits: Dict[Any, int], layer_idx: int, default_bit: int) -> int:
     for key in (layer_idx, str(layer_idx), f"layers.{layer_idx}"):
         if key in block_bits:

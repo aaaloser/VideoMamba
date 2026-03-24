@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -8,6 +9,7 @@ from torch import nn
 from quant.config import CalibrationResult, PTQConfig
 from quant.quant_layers import (
     fake_quantize_mamba_weights_ as _fake_quantize_mamba_weights,
+    quantize_symmetric_to_int,
     quant_dequant_symmetric,
     resolve_block_bit,
     restore_mamba_weights_ as _restore_mamba_weights,
@@ -37,6 +39,94 @@ def fake_quantize_mamba_weights_(
 
 def restore_mamba_weights_(model: nn.Module, backup: Dict[Tuple[int, str], torch.Tensor]) -> None:
     _restore_mamba_weights(iter_mamba_mixers=iter_mamba_mixers(model), backup=backup)
+
+
+def export_quantized_mamba_checkpoint(
+    model: nn.Module,
+    block_bits: Dict[Any, int],
+    save_path: str,
+    default_bit: int = 8,
+    include_non_quantized_state: bool = True,
+) -> Dict[str, Any]:
+    """Export quantized model weights with integer storage and scale metadata.
+
+    Integer storage convention:
+    - 8-bit tensors are stored as int8 codes.
+    - <=4-bit tensors are also stored in int8 container, with `bits` metadata.
+    """
+    target_names = [
+        "in_proj.weight",
+        "in_proj.bias",
+        "conv1d.weight",
+        "conv1d.bias",
+        "x_proj.weight",
+        "x_proj.bias",
+        "dt_proj.weight",
+        "dt_proj.bias",
+        "out_proj.weight",
+        "out_proj.bias",
+        "conv1d_b.weight",
+        "conv1d_b.bias",
+        "x_proj_b.weight",
+        "x_proj_b.bias",
+        "dt_proj_b.weight",
+        "dt_proj_b.bias",
+    ]
+
+    quantized_tensors: Dict[str, Dict[str, Any]] = {}
+    quantized_keys: set[str] = set()
+
+    for layer_idx, mixer in iter_mamba_mixers(model):
+        bits = resolve_block_bit(block_bits, layer_idx, default_bit)
+        named_params = dict(mixer.named_parameters())
+        for name in target_names:
+            if name not in named_params:
+                continue
+
+            p = named_params[name]
+            if not torch.is_floating_point(p.data):
+                continue
+
+            per_channel = p.ndim >= 2 and name.endswith("weight")
+            q_int, scale, qmin, qmax = quantize_symmetric_to_int(
+                p.data,
+                bits=bits,
+                per_channel=per_channel,
+                channel_dim=0,
+            )
+
+            full_key = f"layers.{layer_idx}.mixer.{name}"
+            quantized_keys.add(full_key)
+            quantized_tensors[full_key] = {
+                "q": q_int.detach().cpu(),
+                "scale": scale.detach().cpu().to(torch.float32),
+                "bits": int(bits),
+                "qmin": int(qmin),
+                "qmax": int(qmax),
+                "per_channel": bool(per_channel),
+                "channel_dim": 0,
+                "shape": list(p.shape),
+            }
+
+    non_quantized_state: Dict[str, torch.Tensor] = {}
+    if include_non_quantized_state:
+        for key, tensor in model.state_dict().items():
+            if key not in quantized_keys:
+                non_quantized_state[key] = tensor.detach().cpu()
+
+    payload: Dict[str, Any] = {
+        "format": "videomamba_ptq_int_v1",
+        "block_bits": {str(k): int(v) for k, v in block_bits.items()},
+        "quantized_tensors": quantized_tensors,
+        "non_quantized_state": non_quantized_state,
+    }
+
+    parent_dir = os.path.dirname(save_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    torch.save(payload, save_path)
+    return payload
 
 
 class PTQRuntimeActivationHook:

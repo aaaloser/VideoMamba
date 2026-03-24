@@ -5,7 +5,7 @@ export MASTER_PORT=$((12000 + RANDOM % 20000))
 export OMP_NUM_THREADS=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-JOB_NAME='videomamba_middle_mask_eval_f16_res224_ptq'
+JOB_NAME='videomamba_middle_mask_eval_f16_res224_ptq_h8_l4'
 OUTPUT_DIR="./logs/${JOB_NAME}"
 BATCH_SIZE=32
 
@@ -45,11 +45,13 @@ torchrun \
     --ptq_calib_batches 16 \
     --ptq_quick_batches 8 \
     --ptq_num_groups 4 \
-    --ptq_tau_percentile 80 \
-    --ptq_high_ratio_threshold 0.10 \
+    --ptq_tau_percentile 75 \
+    --ptq_high_ratio_threshold 0.15 \
     --ptq_high_bit 8 \
     --ptq_low_bit 4 \
     --ptq_alpha 0.5 \
     --ptq_beta 0.25 \
     --ptq_gamma 0.25 \
-    --ptq_cls_token_position auto
+    --ptq_cls_token_position auto \
+    --ptq_save_quantized_model \
+    --ptq_quantized_model_path /data/liyifan24/VideoMamba/output_pth/${JOB_NAME}.pth

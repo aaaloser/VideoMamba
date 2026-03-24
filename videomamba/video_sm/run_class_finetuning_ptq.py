@@ -34,6 +34,7 @@ from quant.utils import (
     PTQConfig,
     apply_videomamba_ptq,
     calibrate_videomamba_ptq,
+    export_quantized_mamba_checkpoint,
     quick_eval_allocate_block_bits,
 )
 
@@ -251,6 +252,10 @@ def get_args():
     parser.add_argument('--ptq_cls_token_position', type=str, default='auto',
                         choices=['auto', 'first', 'center', 'none'],
                         help='CLS token position for sequence split in PTQ')
+    parser.add_argument('--ptq_save_quantized_model', action='store_true', default=False,
+                        help='Save integer-form quantized checkpoint after full eval inference')
+    parser.add_argument('--ptq_quantized_model_path', type=str, default='',
+                        help='Output path for integer quantized checkpoint (.pth). If empty, save under output_dir')
 
     known_args, _ = parser.parse_known_args()
 
@@ -722,6 +727,27 @@ def main(args, ds_init):
             ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
             maxk=5 if args.nb_classes >= 5 else 1
         )
+
+        if (
+            args.ptq_enable
+            and ptq_session is not None
+            and args.ptq_save_quantized_model
+            and global_rank == 0
+        ):
+            if args.ptq_quantized_model_path:
+                quantized_save_path = args.ptq_quantized_model_path
+            else:
+                os.makedirs(args.output_dir, exist_ok=True)
+                quantized_save_path = os.path.join(args.output_dir, 'ptq_quantized_model_int.pth')
+
+            _ = export_quantized_mamba_checkpoint(
+                model=model_without_ddp,
+                block_bits=ptq_payload['block_bits'],
+                save_path=quantized_save_path,
+                default_bit=ptq_cfg.default_bit,
+                include_non_quantized_state=True,
+            )
+            print(f"[PTQ] Saved quantized integer checkpoint to: {quantized_save_path}")
 
         if args.ptq_enable and ptq_session is not None:
             ptq_session.close()
