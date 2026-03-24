@@ -45,8 +45,8 @@ torchrun \
     --ptq_calib_batches 16 \
     --ptq_quick_batches 8 \
     --ptq_num_groups 4 \
-    --ptq_tau_percentile 75 \
-    --ptq_high_ratio_threshold 0.15 \
+    --ptq_tau_percentile 85 \
+    --ptq_high_ratio_threshold 0.2 \
     --ptq_high_bit 8 \
     --ptq_low_bit 4 \
     --ptq_alpha 0.5 \

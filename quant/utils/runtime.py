@@ -8,7 +8,10 @@ from torch import nn
 
 from quant.config import CalibrationResult, PTQConfig
 from quant.quant_layers import (
+    QuantizedLinear,
     fake_quantize_mamba_weights_ as _fake_quantize_mamba_weights,
+    pack_int4_signed,
+    quantize_linear_weight,
     quantize_symmetric_to_int,
     quant_dequant_symmetric,
     resolve_block_bit,
@@ -116,6 +119,139 @@ def export_quantized_mamba_checkpoint(
 
     payload: Dict[str, Any] = {
         "format": "videomamba_ptq_int_v1",
+        "block_bits": {str(k): int(v) for k, v in block_bits.items()},
+        "quantized_tensors": quantized_tensors,
+        "non_quantized_state": non_quantized_state,
+    }
+
+    parent_dir = os.path.dirname(save_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    torch.save(payload, save_path)
+    return payload
+
+
+def apply_weight_only_quantized_projections_(
+    model: nn.Module,
+    block_bits: Dict[Any, int],
+    default_bit: int = 8,
+    pack_int4: bool = True,
+) -> Dict[str, Any]:
+    """Replace Mamba `in_proj/out_proj` with real weight-only quantized layers (W8/W4, A16)."""
+    summary: Dict[str, Any] = {
+        "num_replaced": 0,
+        "by_bit": {},
+        "replaced_keys": [],
+    }
+
+    by_bit: Dict[int, int] = {}
+    replaced_keys: List[str] = []
+
+    for layer_idx, mixer in iter_mamba_mixers(model):
+        bits = resolve_block_bit(block_bits, layer_idx, default_bit)
+        for proj_name in ("in_proj", "out_proj"):
+            proj = getattr(mixer, proj_name, None)
+            if proj is None or not isinstance(proj, nn.Linear):
+                continue
+
+            q, scale, _, _ = quantize_linear_weight(proj.weight.data, bits=bits, per_channel=True)
+            if bits <= 4 and pack_int4:
+                q_store = pack_int4_signed(q)
+                packed_int4 = True
+            else:
+                q_store = q.contiguous()
+                packed_int4 = False
+
+            q_layer = QuantizedLinear(
+                packed_weight=q_store,
+                scale=scale,
+                bias=proj.bias.data if proj.bias is not None else None,
+                out_features=proj.out_features,
+                in_features=proj.in_features,
+                bits=bits,
+                packed_int4=packed_int4,
+            )
+            setattr(mixer, proj_name, q_layer)
+
+            by_bit[bits] = by_bit.get(bits, 0) + 1
+            replaced_keys.append(f"layers.{layer_idx}.mixer.{proj_name}")
+
+    summary["num_replaced"] = len(replaced_keys)
+    summary["by_bit"] = {str(k): v for k, v in sorted(by_bit.items(), key=lambda x: x[0])}
+    summary["replaced_keys"] = replaced_keys
+    return summary
+
+
+def export_real_weight_only_checkpoint(
+    model: nn.Module,
+    block_bits: Dict[Any, int],
+    save_path: str,
+    default_bit: int = 8,
+    include_non_quantized_state: bool = True,
+) -> Dict[str, Any]:
+    """Export real W8/W4-A16 checkpoint for `in_proj/out_proj` only.
+
+    `conv1d/x_proj/dt_proj` and other parameters stay in float as protected region.
+    """
+    quantized_tensors: Dict[str, Dict[str, Any]] = {}
+    quantized_keys: set[str] = set()
+
+    for layer_idx, mixer in iter_mamba_mixers(model):
+        bits = resolve_block_bit(block_bits, layer_idx, default_bit)
+        for proj_name in ("in_proj", "out_proj"):
+            proj = getattr(mixer, proj_name, None)
+            if proj is None:
+                continue
+
+            full_key = f"layers.{layer_idx}.mixer.{proj_name}.weight"
+
+            if isinstance(proj, QuantizedLinear):
+                quantized_keys.add(full_key)
+                quantized_tensors[full_key] = {
+                    "q": proj.qweight.detach().cpu(),
+                    "scale": proj.scale.detach().cpu().to(torch.float32),
+                    "bits": int(proj.bits),
+                    "packed_int4": bool(proj.packed_int4),
+                    "per_channel": True,
+                    "channel_dim": 0,
+                    "shape": [proj.out_features, proj.in_features],
+                    "bias": proj.bias.detach().cpu().to(torch.float16) if proj.bias is not None else None,
+                }
+            elif isinstance(proj, nn.Linear):
+                q, scale, qmin, qmax = quantize_symmetric_to_int(
+                    proj.weight.data,
+                    bits=bits,
+                    per_channel=True,
+                    channel_dim=0,
+                )
+                packed_int4 = bool(bits <= 4)
+                q_store = pack_int4_signed(q) if packed_int4 else q
+                quantized_keys.add(full_key)
+                quantized_tensors[full_key] = {
+                    "q": q_store.detach().cpu(),
+                    "scale": scale.detach().cpu().to(torch.float32),
+                    "bits": int(bits),
+                    "qmin": int(qmin),
+                    "qmax": int(qmax),
+                    "packed_int4": packed_int4,
+                    "per_channel": True,
+                    "channel_dim": 0,
+                    "shape": list(proj.weight.shape),
+                    "bias": proj.bias.detach().cpu().to(torch.float16) if proj.bias is not None else None,
+                }
+
+    non_quantized_state: Dict[str, torch.Tensor] = {}
+    if include_non_quantized_state:
+        for key, tensor in model.state_dict().items():
+            if key not in quantized_keys:
+                non_quantized_state[key] = tensor.detach().cpu()
+
+    payload: Dict[str, Any] = {
+        "format": "videomamba_ptq_real_weight_only_v1",
+        "quant_scheme": "W8A16/W4A16",
+        "quantized_ops": ["in_proj", "out_proj"],
+        "protected_ops": ["conv1d", "x_proj", "dt_proj", "selective_scan"],
         "block_bits": {str(k): int(v) for k, v in block_bits.items()},
         "quantized_tensors": quantized_tensors,
         "non_quantized_state": non_quantized_state,

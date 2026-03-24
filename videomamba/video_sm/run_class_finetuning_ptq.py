@@ -30,11 +30,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from quant.utils import (
-    CalibrationResult,
     PTQConfig,
-    apply_videomamba_ptq,
+    apply_weight_only_quantized_projections_,
     calibrate_videomamba_ptq,
-    export_quantized_mamba_checkpoint,
+    export_real_weight_only_checkpoint,
     quick_eval_allocate_block_bits,
 )
 
@@ -644,7 +643,11 @@ def main(args, ds_init):
         optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
 
     if args.eval:
-        ptq_session = None
+        ptq_payload = {
+            'block_bits': {},
+            'block_high_ratio': {},
+            'block_stats': {},
+        }
         if args.ptq_enable:
             if args.disable_eval_during_finetuning:
                 raise ValueError('PTQ requires eval/quick loaders. Do not use --disable_eval_during_finetuning.')
@@ -661,12 +664,6 @@ def main(args, ds_init):
                 low_bit=args.ptq_low_bit,
                 default_bit=args.ptq_high_bit,
             )
-
-            ptq_payload = {
-                'block_bits': {},
-                'block_high_ratio': {},
-                'block_stats': {},
-            }
 
             if global_rank == 0:
                 calib_loader = data_loader_val if data_loader_val is not None else data_loader_test
@@ -700,23 +697,38 @@ def main(args, ds_init):
                 torch.distributed.broadcast_object_list(payload_list, src=0)
                 ptq_payload = payload_list[0]
 
-            calib_result = CalibrationResult(
-                block_stats=ptq_payload['block_stats'],
-                config=ptq_cfg,
-            )
-
             print(f"[PTQ] block_bits = {ptq_payload['block_bits']}")
-            ptq_session = apply_videomamba_ptq(
+            replace_summary = apply_weight_only_quantized_projections_(
                 model=model_without_ddp,
                 block_bits=ptq_payload['block_bits'],
-                calibration=calib_result,
-                cfg=ptq_cfg,
+                default_bit=ptq_cfg.default_bit,
+                pack_int4=True,
             )
+            print(f"[PTQ] Replaced quantized projections: {replace_summary['num_replaced']}, by_bit={replace_summary['by_bit']}")
 
             if global_rank == 0 and args.output_dir:
                 os.makedirs(args.output_dir, exist_ok=True)
                 with open(os.path.join(args.output_dir, 'ptq_block_bits.json'), 'w', encoding='utf-8') as f:
                     json.dump(ptq_payload, f, indent=2)
+
+            if (
+                args.ptq_save_quantized_model
+                and global_rank == 0
+            ):
+                if args.ptq_quantized_model_path:
+                    quantized_save_path = args.ptq_quantized_model_path
+                else:
+                    os.makedirs(args.output_dir, exist_ok=True)
+                    quantized_save_path = os.path.join(args.output_dir, 'ptq_quantized_model_real_wonly.pth')
+
+                _ = export_real_weight_only_checkpoint(
+                    model=model_without_ddp,
+                    block_bits=ptq_payload['block_bits'],
+                    save_path=quantized_save_path,
+                    default_bit=ptq_cfg.default_bit,
+                    include_non_quantized_state=True,
+                )
+                print(f"[PTQ] Saved real weight-only quantized checkpoint to: {quantized_save_path}")
 
             if args.distributed:
                 torch.distributed.barrier()
@@ -727,30 +739,6 @@ def main(args, ds_init):
             ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
             maxk=5 if args.nb_classes >= 5 else 1
         )
-
-        if (
-            args.ptq_enable
-            and ptq_session is not None
-            and args.ptq_save_quantized_model
-            and global_rank == 0
-        ):
-            if args.ptq_quantized_model_path:
-                quantized_save_path = args.ptq_quantized_model_path
-            else:
-                os.makedirs(args.output_dir, exist_ok=True)
-                quantized_save_path = os.path.join(args.output_dir, 'ptq_quantized_model_int.pth')
-
-            _ = export_quantized_mamba_checkpoint(
-                model=model_without_ddp,
-                block_bits=ptq_payload['block_bits'],
-                save_path=quantized_save_path,
-                default_bit=ptq_cfg.default_bit,
-                include_non_quantized_state=True,
-            )
-            print(f"[PTQ] Saved quantized integer checkpoint to: {quantized_save_path}")
-
-        if args.ptq_enable and ptq_session is not None:
-            ptq_session.close()
 
         torch.distributed.barrier()
         if global_rank == 0:
