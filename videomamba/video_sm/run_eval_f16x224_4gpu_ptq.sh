@@ -5,9 +5,17 @@ export MASTER_PORT=$((12000 + RANDOM % 20000))
 export OMP_NUM_THREADS=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-JOB_NAME='videomamba_middle_mask_eval_f16_res224_ptq_h8_l4'
+JOB_NAME='videomamba_middle_mask_eval_f16_res224_ptq_uniform4'
 OUTPUT_DIR="./logs/${JOB_NAME}"
 BATCH_SIZE=32
+
+# Quantization mode setup:
+# - QUANT_METHOD='mixed'   : current method (calibration + quick-eval routing)
+# - QUANT_METHOD='uniform' : global uniform baseline (W8A16 or W4A16)
+#   - set UNIFORM_BIT=8 for Uniform W8A16
+#   - set UNIFORM_BIT=4 for Uniform W4A16
+QUANT_METHOD='uniform'
+UNIFORM_BIT=4
 
 # ===== 按你的实际路径填写 =====
 PREFIX='/data/liyifan24/Datasets/Kinetics-400/'
@@ -42,7 +50,9 @@ torchrun \
     --eval \
     --bf16 \
     --ptq_enable \
-    --ptq_calib_batches 16 \
+    --quant_method "${QUANT_METHOD}" \
+    --ptq_uniform_bit "${UNIFORM_BIT}" \
+    --ptq_calib_batches 4 \
     --ptq_quick_batches 8 \
     --ptq_num_groups 4 \
     --ptq_tau_percentile 85 \

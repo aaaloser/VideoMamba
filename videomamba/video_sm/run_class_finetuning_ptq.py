@@ -31,7 +31,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from quant.utils import (
     PTQConfig,
+    apply_uniform_global_weight_only,
     apply_weight_only_quantized_projections_,
+    build_uniform_block_bits,
     calibrate_videomamba_ptq,
     export_real_weight_only_checkpoint,
     quick_eval_allocate_block_bits,
@@ -228,6 +230,10 @@ def get_args():
     # PTQ parameters
     parser.add_argument('--ptq_enable', action='store_true', default=False,
                         help='Enable VideoMamba PTQ pipeline in eval mode')
+    parser.add_argument('--quant_method', type=str, default='mixed', choices=['mixed', 'uniform'],
+                        help='Quantization method in eval PTQ: mixed (score-based) or uniform (global single bit)')
+    parser.add_argument('--ptq_uniform_bit', type=int, default=8, choices=[4, 8],
+                        help='Uniform global bit for quant_method=uniform')
     parser.add_argument('--ptq_calib_batches', type=int, default=16,
                         help='Number of calibration batches (phase-2)')
     parser.add_argument('--ptq_quick_batches', type=int, default=8,
@@ -652,45 +658,60 @@ def main(args, ds_init):
             if args.disable_eval_during_finetuning:
                 raise ValueError('PTQ requires eval/quick loaders. Do not use --disable_eval_during_finetuning.')
 
-            ptq_cfg = PTQConfig(
-                num_groups=args.ptq_num_groups,
-                cls_token_position=args.ptq_cls_token_position,
-                alpha=args.ptq_alpha,
-                beta=args.ptq_beta,
-                gamma=args.ptq_gamma,
-                tau_percentile=args.ptq_tau_percentile,
-                quick_high_ratio_threshold=args.ptq_high_ratio_threshold,
-                high_bit=args.ptq_high_bit,
-                low_bit=args.ptq_low_bit,
-                default_bit=args.ptq_high_bit,
-            )
+            quant_method = args.quant_method.lower()
+            export_default_bit = args.ptq_high_bit
 
-            if global_rank == 0:
-                calib_loader = data_loader_val if data_loader_val is not None else data_loader_test
-                quick_loader = data_loader_val if data_loader_val is not None else data_loader_test
-
-                print('[PTQ] Phase-2 calibration starts...')
-                calib_result = calibrate_videomamba_ptq(
-                    model=model_without_ddp,
-                    calib_loader=calib_loader,
-                    device=device,
-                    max_calib_batches=args.ptq_calib_batches,
-                    cfg=ptq_cfg,
+            if quant_method == 'mixed':
+                ptq_cfg = PTQConfig(
+                    num_groups=args.ptq_num_groups,
+                    cls_token_position=args.ptq_cls_token_position,
+                    alpha=args.ptq_alpha,
+                    beta=args.ptq_beta,
+                    gamma=args.ptq_gamma,
+                    tau_percentile=args.ptq_tau_percentile,
+                    quick_high_ratio_threshold=args.ptq_high_ratio_threshold,
+                    high_bit=args.ptq_high_bit,
+                    low_bit=args.ptq_low_bit,
+                    default_bit=args.ptq_high_bit,
                 )
+                export_default_bit = ptq_cfg.default_bit
 
-                print('[PTQ] Phase-3 quick-eval starts...')
-                quick_result = quick_eval_allocate_block_bits(
-                    model=model_without_ddp,
-                    quick_loader=quick_loader,
-                    calibration=calib_result,
-                    device=device,
-                    max_quick_batches=args.ptq_quick_batches,
-                    cfg=ptq_cfg,
-                )
+                if global_rank == 0:
+                    calib_loader = data_loader_val if data_loader_val is not None else data_loader_test
+                    quick_loader = data_loader_val if data_loader_val is not None else data_loader_test
 
-                ptq_payload['block_bits'] = quick_result.block_bits
-                ptq_payload['block_high_ratio'] = quick_result.block_high_ratio
-                ptq_payload['block_stats'] = calib_result.block_stats
+                    print('[PTQ][mixed] Phase-2 calibration starts...')
+                    calib_result = calibrate_videomamba_ptq(
+                        model=model_without_ddp,
+                        calib_loader=calib_loader,
+                        device=device,
+                        max_calib_batches=args.ptq_calib_batches,
+                        cfg=ptq_cfg,
+                    )
+
+                    print('[PTQ][mixed] Phase-3 quick-eval starts...')
+                    quick_result = quick_eval_allocate_block_bits(
+                        model=model_without_ddp,
+                        quick_loader=quick_loader,
+                        calibration=calib_result,
+                        device=device,
+                        max_quick_batches=args.ptq_quick_batches,
+                        cfg=ptq_cfg,
+                    )
+
+                    ptq_payload['block_bits'] = quick_result.block_bits
+                    ptq_payload['block_high_ratio'] = quick_result.block_high_ratio
+                    ptq_payload['block_stats'] = calib_result.block_stats
+            elif quant_method == 'uniform':
+                export_default_bit = int(args.ptq_uniform_bit)
+                if global_rank == 0:
+                    ptq_payload['block_bits'] = build_uniform_block_bits(
+                        model=model_without_ddp,
+                        bit=export_default_bit,
+                    )
+                    print(f"[PTQ][uniform] Global bit = {export_default_bit}")
+            else:
+                raise ValueError(f"Unsupported quant_method: {args.quant_method}")
 
             if args.distributed:
                 payload_list = [ptq_payload]
@@ -698,12 +719,20 @@ def main(args, ds_init):
                 ptq_payload = payload_list[0]
 
             print(f"[PTQ] block_bits = {ptq_payload['block_bits']}")
-            replace_summary = apply_weight_only_quantized_projections_(
-                model=model_without_ddp,
-                block_bits=ptq_payload['block_bits'],
-                default_bit=ptq_cfg.default_bit,
-                pack_int4=True,
-            )
+            if quant_method == 'uniform':
+                uniform_apply = apply_uniform_global_weight_only(
+                    model=model_without_ddp,
+                    bit=export_default_bit,
+                    pack_int4=True,
+                )
+                replace_summary = uniform_apply['summary']
+            else:
+                replace_summary = apply_weight_only_quantized_projections_(
+                    model=model_without_ddp,
+                    block_bits=ptq_payload['block_bits'],
+                    default_bit=export_default_bit,
+                    pack_int4=True,
+                )
             print(f"[PTQ] Replaced quantized projections: {replace_summary['num_replaced']}, by_bit={replace_summary['by_bit']}")
 
             if global_rank == 0 and args.output_dir:
@@ -725,7 +754,7 @@ def main(args, ds_init):
                     model=model_without_ddp,
                     block_bits=ptq_payload['block_bits'],
                     save_path=quantized_save_path,
-                    default_bit=ptq_cfg.default_bit,
+                    default_bit=export_default_bit,
                     include_non_quantized_state=True,
                 )
                 print(f"[PTQ] Saved real weight-only quantized checkpoint to: {quantized_save_path}")

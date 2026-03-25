@@ -12,6 +12,7 @@ from quant.utils.runtime import (
     fake_quantize_mamba_weights_,
     restore_mamba_weights_,
 )
+from quant.utils.uniform_global import apply_uniform_global_weight_only, build_uniform_block_bits
 
 __all__ = [
     "PTQConfig",
@@ -27,4 +28,6 @@ __all__ = [
     "fake_quantize_mamba_weights_",
     "restore_mamba_weights_",
     "apply_videomamba_ptq",
+    "build_uniform_block_bits",
+    "apply_uniform_global_weight_only",
 ]
