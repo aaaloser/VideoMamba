@@ -31,10 +31,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from quant.utils import (
     PTQConfig,
+    apply_motion_aware_weight_only_,
     apply_uniform_global_weight_only,
     apply_weight_only_quantized_projections_,
     build_uniform_block_bits,
     calibrate_videomamba_ptq,
+    capture_in_proj_activations,
+    compute_motion_aware_in_proj_scales,
     export_real_weight_only_checkpoint,
     quick_eval_allocate_block_bits,
 )
@@ -234,10 +237,14 @@ def get_args():
                         help='Quantization method in eval PTQ: mixed (score-based) or uniform (global single bit)')
     parser.add_argument('--ptq_uniform_bit', type=int, default=8, choices=[4, 8],
                         help='Uniform global bit for quant_method=uniform')
-    parser.add_argument('--ptq_calib_batches', type=int, default=16,
-                        help='Number of calibration batches (phase-2)')
-    parser.add_argument('--ptq_quick_batches', type=int, default=8,
-                        help='Number of quick-eval batches (phase-3)')
+    parser.add_argument('--ptq_calib_size', type=int, default=None,
+                        help='Total number of calibration samples (phase-2). Default: 4 x batch_size')
+    parser.add_argument('--ptq_calib_batch_size', type=int, default=8,
+                        help='Calibration forward sub-batch size (memory saver); 0 = no split (use loader batch)')
+    parser.add_argument('--ptq_calib_batches', type=int, default=None,
+                        help='[deprecated] Number of loader batches for calibration (legacy; prefer --ptq_calib_size)')
+    parser.add_argument('--ptq_quick_batches', type=int, default=50,
+                        help='Number of quick-eval batches (phase-3, TimeSformer step-3 default=50)')
     parser.add_argument('--ptq_num_groups', type=int, default=4,
                         help='Temporal group count for PTQ stats')
     parser.add_argument('--ptq_tau_percentile', type=float, default=90.0,
@@ -248,6 +255,11 @@ def get_args():
                         help='Bit width for high-sensitivity blocks')
     parser.add_argument('--ptq_low_bit', type=int, default=4,
                         help='Bit width for low-sensitivity blocks')
+    parser.add_argument('--ptq_bit_allocation_mode', type=str, default='rank',
+                        choices=['rank', 'threshold'],
+                        help='Block bit allocation: rank (top-fraction, step-4) or threshold (legacy)')
+    parser.add_argument('--ptq_high_block_fraction', type=float, default=0.5,
+                        help='Fraction of blocks assigned high_bit in rank mode (e.g. 0.5 = half INT8)')
     parser.add_argument('--ptq_alpha', type=float, default=0.5,
                         help='Weight of residual score in sensitivity fusion')
     parser.add_argument('--ptq_beta', type=float, default=0.25,
@@ -261,6 +273,21 @@ def get_args():
                         help='Save integer-form quantized checkpoint after full eval inference')
     parser.add_argument('--ptq_quantized_model_path', type=str, default='',
                         help='Output path for integer quantized checkpoint (.pth). If empty, save under output_dir')
+
+    # ---- Step-5: motion-aware per-output-channel scale optimization ----
+    parser.add_argument('--ptq_scale_mode', type=str, default='minmax',
+                        choices=['minmax', 'motion'],
+                        help='Scale mode for in_proj: minmax (per-channel absmax) or motion (step-5 motion-aware search)')
+    parser.add_argument('--ptq_motion_candidates', type=int, default=32,
+                        help='Number of candidate scale factors for motion-aware search (0.5x..1.5x)')
+    parser.add_argument('--ptq_motion_eta', type=float, default=0.5,
+                        help='Motion weight: redundancy weight in frame scoring (eta)')
+    parser.add_argument('--ptq_motion_tau', type=float, default=0.7,
+                        help='Motion weight: softmax temperature for frame weights (tau_m)')
+    parser.add_argument('--ptq_motion_rho', type=float, default=0.2,
+                        help='Motion weight: uniform prior mixing ratio (rho)')
+    parser.add_argument('--ptq_motion_capture_batches', type=int, default=0,
+                        help='Num loader batches to capture for motion scale (0 = reuse calibration samples)')
 
     known_args, _ = parser.parse_known_args()
 
@@ -322,6 +349,7 @@ def main(args, ds_init):
             dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
     else:
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_test = torch.utils.data.SequentialSampler(dataset_test)
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -673,6 +701,8 @@ def main(args, ds_init):
                     high_bit=args.ptq_high_bit,
                     low_bit=args.ptq_low_bit,
                     default_bit=args.ptq_high_bit,
+                    bit_allocation_mode=args.ptq_bit_allocation_mode,
+                    high_block_fraction=args.ptq_high_block_fraction,
                 )
                 export_default_bit = ptq_cfg.default_bit
 
@@ -680,12 +710,24 @@ def main(args, ds_init):
                     calib_loader = data_loader_val if data_loader_val is not None else data_loader_test
                     quick_loader = data_loader_val if data_loader_val is not None else data_loader_test
 
+                    loader_bs = max(int(args.batch_size), 1)
+                    if args.ptq_calib_size is not None and args.ptq_calib_size > 0:
+                        calib_size = int(args.ptq_calib_size)
+                    elif args.ptq_calib_batches is not None and args.ptq_calib_batches > 0:
+                        calib_size = int(args.ptq_calib_batches) * loader_bs
+                    else:
+                        calib_size = 4 * loader_bs
+                    calib_bs = args.ptq_calib_batch_size if (args.ptq_calib_batch_size or 0) > 0 else None
+                    print(f'[PTQ][mixed] Calibration: calib_size={calib_size} samples, '
+                          f'calib_batch_size={calib_bs if calib_bs else loader_bs} (loader batch={loader_bs})')
+
                     print('[PTQ][mixed] Phase-2 calibration starts...')
                     calib_result = calibrate_videomamba_ptq(
                         model=model_without_ddp,
                         calib_loader=calib_loader,
                         device=device,
-                        max_calib_batches=args.ptq_calib_batches,
+                        calib_size=calib_size,
+                        calib_batch_size=calib_bs,
                         cfg=ptq_cfg,
                     )
 
@@ -702,6 +744,60 @@ def main(args, ds_init):
                     ptq_payload['block_bits'] = quick_result.block_bits
                     ptq_payload['block_high_ratio'] = quick_result.block_high_ratio
                     ptq_payload['block_stats'] = calib_result.block_stats
+                    ptq_payload['block_rank'] = quick_result.block_rank
+                    ptq_payload['n_high'] = quick_result.n_high
+                    n8 = sum(1 for b in quick_result.block_bits.values() if b == args.ptq_high_bit)
+                    n4 = len(quick_result.block_bits) - n8
+                    print(f"[PTQ][mixed] bit_allocation_mode={ptq_cfg.bit_allocation_mode}, "
+                          f"n_blocks={len(quick_result.block_bits)}, n_high={quick_result.n_high}, "
+                          f"INT8={n8}, INT4={n4}, high_block_fraction={ptq_cfg.high_block_fraction}")
+                    if quick_result.quick_top1 is not None:
+                        print(f"[PTQ][mixed] quick_top1 (FP32 baseline) = {quick_result.quick_top1:.2f}% "
+                              f"on {args.ptq_quick_batches} batches")
+                    print(f"[PTQ][mixed] block_calls (calls_b): {quick_result.block_calls}")
+
+                    # Step-5: motion-aware in_proj scale optimization
+                    if args.ptq_scale_mode == 'motion':
+                        if args.ptq_motion_capture_batches and args.ptq_motion_capture_batches > 0:
+                            motion_acts = capture_in_proj_activations(
+                                model=model_without_ddp,
+                                data_loader=calib_loader,
+                                device=device,
+                                max_batches=args.ptq_motion_capture_batches,
+                                cfg=ptq_cfg,
+                            )
+                            print(f"[PTQ][motion] Capturing in_proj activations "
+                                  f"({args.ptq_motion_capture_batches} loader batches)...")
+                        else:
+                            motion_acts = capture_in_proj_activations(
+                                model=model_without_ddp,
+                                data_loader=calib_loader,
+                                device=device,
+                                calib_size=calib_size,
+                                calib_batch_size=calib_bs,
+                                cfg=ptq_cfg,
+                            )
+                            print(f"[PTQ][motion] Capturing in_proj activations "
+                                  f"({calib_size} samples, sub-batch {calib_bs if calib_bs else loader_bs})...")
+                        print(f"[PTQ][motion] Computing motion-aware in_proj scales "
+                              f"(n_candidates={args.ptq_motion_candidates}, eta={args.ptq_motion_eta}, "
+                              f"tau_m={args.ptq_motion_tau}, rho={args.ptq_motion_rho})...")
+                        motion_scales = compute_motion_aware_in_proj_scales(
+                            model=model_without_ddp,
+                            block_bits=quick_result.block_bits,
+                            activations=motion_acts,
+                            cfg=ptq_cfg,
+                            default_bit=export_default_bit,
+                            n_candidates=args.ptq_motion_candidates,
+                            eta=args.ptq_motion_eta,
+                            tau_m=args.ptq_motion_tau,
+                            rho=args.ptq_motion_rho,
+                        )
+                        print(f"[PTQ][motion] Computed motion-aware scales for "
+                              f"{len(motion_scales)} in_proj layers")
+                        ptq_payload['motion_in_proj_scales'] = {
+                            k: v for k, v in motion_scales.items()
+                        }
             elif quant_method == 'uniform':
                 export_default_bit = int(args.ptq_uniform_bit)
                 if global_rank == 0:
@@ -727,16 +823,38 @@ def main(args, ds_init):
                 )
                 replace_summary = uniform_apply['summary']
             else:
-                replace_summary = apply_weight_only_quantized_projections_(
-                    model=model_without_ddp,
-                    block_bits=ptq_payload['block_bits'],
-                    default_bit=export_default_bit,
-                    pack_int4=True,
-                )
+                if args.ptq_scale_mode == 'motion':
+                    pre_scales = ptq_payload.get('motion_in_proj_scales', {})
+                    replace_summary = apply_motion_aware_weight_only_(
+                        model=model_without_ddp,
+                        block_bits=ptq_payload['block_bits'],
+                        cfg=ptq_cfg,
+                        default_bit=export_default_bit,
+                        pack_int4=True,
+                        precomputed_in_proj_scales=pre_scales,
+                        n_candidates=args.ptq_motion_candidates,
+                        eta=args.ptq_motion_eta,
+                        tau_m=args.ptq_motion_tau,
+                        rho=args.ptq_motion_rho,
+                    )
+                    print(f"[PTQ] motion-aware in_proj layers: {len(replace_summary.get('motion_applied', []))}")
+                else:
+                    replace_summary = apply_weight_only_quantized_projections_(
+                        model=model_without_ddp,
+                        block_bits=ptq_payload['block_bits'],
+                        default_bit=export_default_bit,
+                        pack_int4=True,
+                    )
             print(f"[PTQ] Replaced quantized projections: {replace_summary['num_replaced']}, by_bit={replace_summary['by_bit']}")
 
             if global_rank == 0 and args.output_dir:
                 os.makedirs(args.output_dir, exist_ok=True)
+                # motion scales are CPU tensors by design (DDP broadcast); convert
+                # to lists so the payload is JSON-serializable.
+                if 'motion_in_proj_scales' in ptq_payload:
+                    ptq_payload['motion_in_proj_scales'] = {
+                        str(k): v.tolist() for k, v in ptq_payload['motion_in_proj_scales'].items()
+                    }
                 with open(os.path.join(args.output_dir, 'ptq_block_bits.json'), 'w', encoding='utf-8') as f:
                     json.dump(ptq_payload, f, indent=2)
 
@@ -769,7 +887,8 @@ def main(args, ds_init):
             maxk=5 if args.nb_classes >= 5 else 1
         )
 
-        torch.distributed.barrier()
+        if args.distributed:
+            torch.distributed.barrier()
         if global_rank == 0:
             print("Start merging results...")
             final_top1 ,final_top5 = merge(args.output_dir, num_tasks)
@@ -853,7 +972,8 @@ def main(args, ds_init):
         ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
         maxk=5 if args.nb_classes >= 5 else 1
     )
-    torch.distributed.barrier()
+    if args.distributed:
+        torch.distributed.barrier()
     if global_rank == 0:
         print("Start merging results...")
         final_top1 ,final_top5 = merge(args.output_dir, num_tasks)

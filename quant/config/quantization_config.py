@@ -23,6 +23,9 @@ class PTQConfig:
     lambda_max: float = 0.95
     default_lambda: float = 0.50
     default_bit: int = 8
+    bit_allocation_mode: str = "rank"  # rank | threshold
+    high_block_fraction: float = 0.5  # rank mode: top fraction of blocks -> high_bit
+    num_quick_eval_batches: int = 50  # TimeSformer step-3 default quick-eval batches
 
 
 @dataclass
@@ -35,7 +38,11 @@ class CalibrationResult:
 
 @dataclass
 class QuickEvalResult:
-    """Static block bit allocation from quick-eval stage."""
+    """Static block bit allocation from quick-eval stage (TimeSformer step-3+4)."""
 
     block_bits: Dict[int, int]
     block_high_ratio: Dict[int, float]
+    block_rank: Optional[Dict[int, int]] = None  # rank position (0=highest sensitivity)
+    n_high: Optional[int] = None  # number of blocks assigned high_bit (rank mode)
+    quick_top1: Optional[float] = None  # FP32 model Top-1 on quick-eval batches (step-3-6)
+    block_calls: Optional[Dict[int, int]] = None  # calls_b: forward call count per block

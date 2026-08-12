@@ -13,6 +13,13 @@ from quant.utils.runtime import (
     restore_mamba_weights_,
 )
 from quant.utils.uniform_global import apply_uniform_global_weight_only, build_uniform_block_bits
+from quant.utils.motion_scale import (
+    apply_motion_aware_weight_only_,
+    capture_in_proj_activations,
+    compute_motion_aware_in_proj_scales,
+    compute_motion_aware_scale,
+    compute_motion_frame_weights,
+)
 
 __all__ = [
     "PTQConfig",
@@ -30,4 +37,9 @@ __all__ = [
     "apply_videomamba_ptq",
     "build_uniform_block_bits",
     "apply_uniform_global_weight_only",
+    "apply_motion_aware_weight_only_",
+    "capture_in_proj_activations",
+    "compute_motion_aware_in_proj_scales",
+    "compute_motion_aware_scale",
+    "compute_motion_frame_weights",
 ]

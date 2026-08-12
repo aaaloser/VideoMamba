@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from quant.config import PTQConfig
+from quant.quant_layers.quantization_ops import quant_dequant_symmetric
 
 
 def extract_video_tensor(batch: Any) -> torch.Tensor:
@@ -22,6 +23,61 @@ def extract_video_tensor(batch: Any) -> torch.Tensor:
             if isinstance(value, torch.Tensor):
                 return value
     raise TypeError("Unable to extract video tensor from dataloader batch.")
+
+
+def extract_label(batch: Any) -> Optional[torch.Tensor]:
+    """Extract label tensor from a dataloader batch (if present).
+
+    Supports tuple/list batches ``[video, label]`` and dict batches with
+    keys ``label/labels/target/targets/y``. Returns ``None`` when no label
+    is found.
+    """
+    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        if isinstance(batch[1], torch.Tensor):
+            return batch[1]
+    if isinstance(batch, MutableMapping):
+        for key in ("label", "labels", "target", "targets", "y"):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                return value
+    return None
+
+
+def iter_calib_tensors(
+    data_loader: Iterable[Any],
+    device: torch.device,
+    calib_size: int,
+    calib_batch_size: Optional[int] = None,
+) -> Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """Yield (video, label) pairs for calibration forwards with sub-batch splitting.
+
+    Consumes loader batches until ``calib_size`` samples in total and splits each
+    loader batch into sub-batches of ``calib_batch_size`` samples, so the
+    calibration forward runs on smaller chunks (lower peak activation memory).
+    ``calib_batch_size`` <= 0 or >= loader batch size disables splitting; a
+    trailing partial sub-batch is yielded as-is. The label belongs to the whole
+    loader batch, so it is only valid when no splitting/truncation happened
+    (i.e. do not use with return_predictions=True in the calibration path).
+    """
+    if calib_size is None or calib_size <= 0:
+        return
+    seen = 0
+    for batch in data_loader:
+        if seen >= calib_size:
+            break
+        video = extract_video_tensor(batch)
+        label = extract_label(batch)
+        n = int(video.shape[0])
+        remaining = calib_size - seen
+        if n > remaining:
+            video = video[:remaining]
+            n = remaining
+        if calib_batch_size is None or calib_batch_size <= 0 or calib_batch_size >= n:
+            yield video.to(device, non_blocking=True), label
+        else:
+            for i in range(0, n, calib_batch_size):
+                yield video[i : i + calib_batch_size].to(device, non_blocking=True), None
+        seen += n
 
 
 def iter_mamba_mixers(model: nn.Module) -> Iterable[Tuple[int, nn.Module]]:
@@ -210,10 +266,28 @@ def collect_layer_group_metrics(
     model: nn.Module,
     data_loader: Iterable[Any],
     device: torch.device,
-    max_batches: int,
-    cfg: PTQConfig,
-) -> Dict[int, List[Dict[str, float]]]:
+    max_batches: Optional[int] = None,
+    cfg: Optional[PTQConfig] = None,
+    return_predictions: bool = False,
+    calib_size: Optional[int] = None,
+    calib_batch_size: Optional[int] = None,
+) -> Tuple[Dict[int, List[Dict[str, float]]], Dict[int, List[float]], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+    """Collect per-layer per-group metrics (R, E_spa, E_temp) and lambda_error.
+
+    When ``return_predictions=True``, also captures ``(output, label)`` per batch
+    so the caller can compute quick-eval Top-1 accuracy in the same forward pass.
+    Returns ``(layer_metrics, layer_lambda, predictions)``; predictions is None
+    when return_predictions is False.
+
+    Either ``max_batches`` (legacy: number of loader batches) or ``calib_size``
+    (total calibration samples) must be given. With ``calib_size``, each loader
+    batch is split into ``calib_batch_size`` sub-batches per forward to reduce
+    peak activation memory; labels are then unavailable (use only with
+    return_predictions=False).
+    """
     layer_metrics: Dict[int, List[Dict[str, float]]] = {}
+    layer_lambda: Dict[int, List[float]] = {}
+    predictions: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if return_predictions else None
     hook_handles: List[Any] = []
 
     def _make_hook(layer_idx: int, mixer: nn.Module):
@@ -226,13 +300,118 @@ def collect_layer_group_metrics(
             t_steps = infer_temporal_steps(model, tokens, cfg)
             stats = group_metrics_for_layer(hs, mixer, t_steps, cfg)
             layer_metrics.setdefault(layer_idx, []).extend(stats)
+            lam = compute_lambda_error_for_layer(hs, t_steps, cfg, bits=cfg.low_bit)
+            layer_lambda.setdefault(layer_idx, []).append(lam)
+
+        return _hook
+
+    if calib_size is not None:
+        batch_iter: Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]] = iter_calib_tensors(
+            data_loader, device, calib_size, calib_batch_size
+        )
+    elif max_batches is not None:
+        batch_iter = (
+            (extract_video_tensor(batch).to(device, non_blocking=True), extract_label(batch))
+            for bidx, batch in enumerate(data_loader)
+            if bidx < max_batches
+        )
+    else:
+        raise ValueError("collect_layer_group_metrics requires either max_batches or calib_size")
+
+    model.eval()
+    with torch.no_grad():
+        for idx, mixer in iter_mamba_mixers(model):
+            hook_handles.append(mixer.register_forward_pre_hook(_make_hook(idx, mixer)))
+
+        for video, label in batch_iter:
+            output = model(video)
+            if predictions is not None and label is not None:
+                predictions.append((output.detach().cpu(), label.detach().cpu()))
+
+    for h in hook_handles:
+        h.remove()
+
+    return layer_metrics, layer_lambda, predictions
+
+
+def compute_lambda_error_for_layer(
+    hidden_states: torch.Tensor,
+    t_steps: int,
+    cfg: PTQConfig,
+    bits: int = 4,
+) -> float:
+    """INT4 adjacent-group quantization error prediction coefficient (TimeSformer step 2-5).
+
+    For each adjacent temporal-group pair (g, g+1), quantize both groups with
+    symmetric low-bit, compute errors e_g and e_{g+1}, and solve the
+    least-squares predictor e_{g+1} ~= lambda * e_g. Per-batch estimates are
+    clamped to [-1, 1], then averaged over batch and adjacent pairs, yielding
+    one scalar lambda for this forward pass. The caller takes the median over
+    calibration samples to get the block-level lambda_error.
+    """
+    hs = hidden_states.detach()
+    cls_token, x_tokens, _ = split_cls_and_tokens(hs, cfg.cls_token_position)
+    del cls_token
+    x_st, _ = reshape_to_spatiotemporal(x_tokens, t_steps)
+
+    bounds = group_boundaries(x_st.shape[1], cfg.num_groups)
+    if len(bounds) < 2:
+        return 0.0
+
+    pair_lambdas: List[torch.Tensor] = []
+    for i in range(len(bounds) - 1):
+        s0, e0 = bounds[i]
+        s1, e1 = bounds[i + 1]
+        xg = x_st[:, s0:e0, :, :]
+        xg1 = x_st[:, s1:e1, :, :]
+        eg = xg - quant_dequant_symmetric(xg, bits=bits)
+        eg1 = xg1 - quant_dequant_symmetric(xg1, bits=bits)
+        eg_flat = eg.reshape(eg.shape[0], -1)
+        eg1_flat = eg1.reshape(eg1.shape[0], -1)
+        num = (eg_flat * eg1_flat).sum(dim=1)
+        den = (eg_flat * eg_flat).sum(dim=1).clamp(min=cfg.eps)
+        lam_b = (num / den).clamp(-1.0, 1.0)
+        pair_lambdas.append(lam_b)
+
+    stack = torch.stack(pair_lambdas, dim=0)  # [num_pairs, B]
+    return float(stack.mean().item())
+
+
+def collect_layer_lambda_error(
+    model: nn.Module,
+    data_loader: Iterable[Any],
+    device: torch.device,
+    max_batches: int,
+    cfg: PTQConfig,
+    bits: Optional[int] = None,
+) -> Dict[int, List[float]]:
+    """Collect per-block INT4 adjacent-group lambda_error over calibration batches.
+
+    Mirrors ``collect_layer_group_metrics`` but computes the error-prediction
+    coefficient instead of group sensitivity metrics. Returns per-block lists of
+    per-forward-pass lambda estimates (caller takes the median).
+    """
+    quant_bits = int(bits) if bits is not None else int(cfg.low_bit)
+    layer_lambda: Dict[int, List[float]] = {}
+    hook_handles: List[Any] = []
+
+    def _make_hook(layer_idx: int):
+        def _hook(module: nn.Module, inputs: Tuple[Any, ...]) -> None:
+            if len(inputs) == 0 or not isinstance(inputs[0], torch.Tensor):
+                return
+            hs = inputs[0]
+            cls_idx = resolve_cls_index(hs.shape[1], cfg.cls_token_position)
+            tokens = hs.shape[1] - (1 if cls_idx is not None else 0)
+            t_steps = infer_temporal_steps(model, tokens, cfg)
+            lam = compute_lambda_error_for_layer(hs, t_steps, cfg, bits=quant_bits)
+            layer_lambda.setdefault(layer_idx, []).append(lam)
 
         return _hook
 
     model.eval()
     with torch.no_grad():
         for idx, mixer in iter_mamba_mixers(model):
-            hook_handles.append(mixer.register_forward_pre_hook(_make_hook(idx, mixer)))
+            hook_handles.append(mixer.register_forward_pre_hook(_make_hook(idx)))
 
         for bidx, batch in enumerate(data_loader):
             if bidx >= max_batches:
@@ -243,4 +422,4 @@ def collect_layer_group_metrics(
     for h in hook_handles:
         h.remove()
 
-    return layer_metrics
+    return layer_lambda
