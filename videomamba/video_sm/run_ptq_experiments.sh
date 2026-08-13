@@ -13,6 +13,10 @@ set -euo pipefail
 #   EXPERIMENT=mixed-rank-motion PTQ_MOTION_ETA=0.3 bash run_ptq_experiments.sh
 #   EXPERIMENT=mixed-rank-minmax PTQ_HIGH_BLOCK_FRACTION=0.75 bash run_ptq_experiments.sh
 #
+# 切换数据集 (默认 k400):
+#   DATASET=ssv2 bash run_ptq_experiments.sh            # Something-Something V2 (抽帧数据)
+#   DATASET=ssv2 CKPT=/path/to/ssv2_ckpt.pth bash run_ptq_experiments.sh
+#
 # 切换 GPU/多卡:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC=4 bash run_ptq_experiments.sh
 #
@@ -33,12 +37,60 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 # ---- 实验模式 ----
 EXPERIMENT=${EXPERIMENT:-mixed-rank-minmax}
 
-# ---- 数据/模型路径 ----
-PREFIX='/data/liyifan24/Datasets/Kinetics-400/'
-DATA_PATH='/data/liyifan24/Datasets/Kinetics-400/'
-EVAL_DATA_PATH='/data/liyifan24/Datasets/Kinetics-400/val_model_label.csv'
-CKPT='/data/liyifan24/VideoMamba/pretrain_model/videomamba_m16_k400_mask_ft_f16_res224.pth'
+# ---- 数据集切换 (k400 | ssv2) ----
+DATASET=${DATASET:-k400}
+
+# ---- 数据/模型路径 (按数据集) ----
 OUTPUT_BASE=${OUTPUT_BASE:-./logs}
+
+case "${DATASET}" in
+  k400)
+    DATA_SET='Kinetics_sparse'
+    NB_CLASSES=400
+    PREFIX='/data/liyifan24/Datasets/Kinetics-400/'
+    DATA_PATH='/data/liyifan24/Datasets/Kinetics-400/'
+    EVAL_DATA_PATH='/data/liyifan24/Datasets/Kinetics-400/val_model_label.csv'
+    CKPT_DEFAULT='/data/liyifan24/VideoMamba/pretrain_model/videomamba_m16_k400_mask_ft_f16_res224.pth'
+    USE_DECORD_FLAG=()            # 默认 use_decord=True (视频文件)
+    TEST_SEG_DEFAULT=4
+    JOB_SUFFIX_DEFAULT=''
+    QUANT_SUBDIR=''
+    FILENAME_TMPL=''
+    ;;
+  ssv2)
+    DATA_SET='SSV2'
+    NB_CLASSES=174
+    PREFIX='/data/liyifan24/Datasets/somethingv2/frame/'
+    DATA_PATH='/data/liyifan24/VideoMamba/output_pth/SSv2/metadata'
+    EVAL_DATA_PATH=''
+    CKPT_DEFAULT='/data/liyifan24/VideoMamba/pretrain_model/videomamba_m16_ssv2_mask_ft_f16_res224.pth'
+    USE_DECORD_FLAG=(--no_use_decord)   # 抽帧数据, 走 SSRawFrameClsDataset
+    TEST_SEG_DEFAULT=2
+    JOB_SUFFIX_DEFAULT='_ssv2'
+    QUANT_SUBDIR='SSv2'
+    FILENAME_TMPL='{:06}.jpg'   # frame/ 下文件名为 000001.jpg (6位零填充; 默认 img_{:05}.jpg 不匹配)
+    ;;
+  *)
+    echo "ERROR: Unknown DATASET='${DATASET}'"
+    echo "Available: k400, ssv2"
+    exit 1
+    ;;
+esac
+
+CKPT=${CKPT:-${CKPT_DEFAULT}}
+
+# ---- SSv2 metadata 自动生成 (videofolder 格式 -> train/val/test.csv) ----
+if [ "${DATASET}" = "ssv2" ]; then
+  SSV2_META_SRC='/data/liyifan24/Datasets/somethingv2'
+  mkdir -p "${DATA_PATH}"
+  for entry in train:train_videofolder.txt val:val_videofolder.txt test:val_videofolder.txt; do
+    csv_name="${entry%%:*}"; src_name="${entry##*:}"
+    if [ ! -f "${DATA_PATH}/${csv_name}.csv" ]; then
+      cp "${SSV2_META_SRC}/${src_name}" "${DATA_PATH}/${csv_name}.csv"
+      echo "[run] generated ${DATA_PATH}/${csv_name}.csv (from ${SSV2_META_SRC}/${src_name})"
+    fi
+  done
+fi
 
 # ---- 通用参数 (均可通过环境变量覆盖) ----
 BATCH_SIZE=${BATCH_SIZE:-32}
@@ -62,7 +114,7 @@ MOTION_RHO=${PTQ_MOTION_RHO:-0.2}
 MOTION_CAPTURE_BATCHES=${PTQ_MOTION_CAPTURE_BATCHES:-0}
 
 # ---- 评测参数 ----
-TEST_NUM_SEGMENT=${TEST_NUM_SEGMENT:-4}
+TEST_NUM_SEGMENT=${TEST_NUM_SEGMENT:-${TEST_SEG_DEFAULT}}
 TEST_NUM_CROP=${TEST_NUM_CROP:-3}
 
 # ---- 保存量化模型 ----
@@ -104,10 +156,14 @@ SCALE_MODE=${PTQ_SCALE_MODE:-$E_SCALE}
 HIGH_BLOCK_FRACTION=${PTQ_HIGH_BLOCK_FRACTION:-$E_FRAC}
 
 # ---- 输出目录 ----
-JOB_NAME="ptq_${EXPERIMENT}"
+JOB_NAME="ptq_${EXPERIMENT}${JOB_SUFFIX_DEFAULT}"
 OUTPUT_DIR="${OUTPUT_BASE}/${JOB_NAME}"
 mkdir -p "${OUTPUT_DIR}"
-QUANT_PATH="${QUANTIZED_MODEL_PATH:-${QUANTIZED_OUTPUT_DIR}/${JOB_NAME}.pth}"
+if [ -n "${QUANTIZED_MODEL_PATH}" ]; then
+  QUANT_PATH="${QUANTIZED_MODEL_PATH}"
+else
+  QUANT_PATH="${QUANTIZED_OUTPUT_DIR}/${QUANT_SUBDIR:+${QUANT_SUBDIR}/}${JOB_NAME}.pth"
+fi
 
 # ============================================================
 # 打印实验配置
@@ -116,7 +172,9 @@ echo "============================================================"
 echo " VideoMamba PTQ Experiment"
 echo "============================================================"
 echo "  EXPERIMENT        : ${EXPERIMENT}"
+echo "  DATASET           : ${DATASET}  (data_set=${DATA_SET}, nb_classes=${NB_CLASSES})"
 echo "  GPU               : CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}, nproc=${NPROC}"
+echo "  CKPT              : ${CKPT}"
 echo "  QUANT_METHOD      : ${QUANT_METHOD}"
 echo "  SCALE_MODE        : ${SCALE_MODE}"
 echo "  BIT_ALLOC_MODE    : ${BIT_ALLOCATION_MODE}"
@@ -192,11 +250,10 @@ COMMON_ARGS=(
     --model videomamba_middle
     --finetune "${CKPT}"
     --data_path "${DATA_PATH}"
-    --eval_data_path "${EVAL_DATA_PATH}"
     --prefix "${PREFIX}"
-    --data_set 'Kinetics_sparse'
+    --data_set "${DATA_SET}"
     --split ' '
-    --nb_classes 400
+    --nb_classes "${NB_CLASSES}"
     --log_dir "${OUTPUT_DIR}"
     --output_dir "${OUTPUT_DIR}"
     --batch_size "${BATCH_SIZE}"
@@ -209,8 +266,19 @@ COMMON_ARGS=(
     --test_num_crop "${TEST_NUM_CROP}"
     --eval
     --bf16
+    "${USE_DECORD_FLAG[@]}"
     "${PTQ_ARGS[@]}"
 )
+
+# --eval_data_path 仅 k400 (Kinetics_sparse test 分支使用); SSV2 分支固定读 data_path/test.csv
+if [ -n "${EVAL_DATA_PATH}" ]; then
+  COMMON_ARGS+=(--eval_data_path "${EVAL_DATA_PATH}")
+fi
+
+# --filename_tmpl 仅 ssv2 (抽帧文件名模板, 默认 img_{:05}.jpg 与本数据集不匹配)
+if [ -n "${FILENAME_TMPL}" ]; then
+  COMMON_ARGS+=(--filename_tmpl "${FILENAME_TMPL}")
+fi
 
 if [ "${NPROC}" -le 1 ]; then
     echo "[run] Single GPU mode (python, no dist_eval)"

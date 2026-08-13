@@ -161,6 +161,56 @@ merge 最终: Top-1 82.95%, Top-5 95.70%（写入 logs/ptq_mixed-rank-motion/log
 
 说明：测试中打印的 Acc@1 为 batch 级均值；merge 后（4 段 × 3 crop 投票）82.95% 与 fp16 基线 83.4% 非常接近，该 W8/W4 混合 + motion scale 方案基本无损。该结果由崩溃前已写好的 `0.txt` 手动执行 `merge()` 恢复，未重跑约 3h 的评测。
 
+## 2026-08-12 SSv2 适配：work1 方法跨数据集（运行参数切换）
+
+**目标**: 将 work1（mixed-rank-motion, W8/W4-A16 权重量化）从 K400 移植到 Something-Something V2，数据集切换作为运行参数 `DATASET=k400|ssv2`（默认 k400，原行为完全不变）。
+
+**数据集情况**:
+- 路径: `/data/liyifan24/Datasets/somethingv2/`
+- 抽帧格式: `frame/<id>/000001.jpg`（6 位零填充，无 `img_` 前缀；`val_videofolder.txt` 共 24777 个视频）
+- 标注: `train_videofolder.txt` / `val_videofolder.txt`（videofolder 格式 `id num_frames label`，174 类 0-173）
+- 预训练模型: `pretrain_model/videomamba_m16_ssv2_f16_res224.pth`（用户上传，fp16）
+
+**改动**（`videomamba/video_sm/run_ptq_experiments.sh`）:
+
+| 项 | 说明 |
+|------|------|
+| `DATASET` 参数 | `DATASET=k400\|ssv2`，默认 k400；未知值报错退出 |
+| k400 分支 | 原路径/协议完全不变（Kinetics_sparse, 400 类, 4×3, `--eval_data_path`） |
+| ssv2 分支 | `--data_set SSV2` + `--no_use_decord`（`SSRawFrameClsDataset` 读帧）；`--nb_classes 174` |
+| 路径 | `--prefix` = `somethingv2/frame/`；`--data_path` = `output_pth/SSv2/metadata`（自动生成） |
+| metadata 自动生成 | 首次运行自动 `cp`：`train_videofolder.txt`→`train.csv`、`val_videofolder.txt`→`val.csv`/`test.csv`（test 复用 val，SSv2 测试标签不公开，官方即在 val 上评测） |
+| 评测协议 | `--test_num_segment 2` / `--test_num_crop 3`（官方 2×3，可覆盖；k400 仍 4×3） |
+| CKPT | 默认 `videomamba_m16_ssv2_f16_res224.pth`，`CKPT=` 环境变量可覆盖 |
+| 输出隔离 | 日志目录 `logs/ptq_<experiment>_ssv2/`；量化模型默认 `output_pth/SSv2/ptq_<experiment>.pth` |
+| `--filename_tmpl` | ssv2 追加 `{:06}.jpg`（仅 ssv2 传，k400 不传） |
+
+**踩坑与修复**:
+- 首次 GPU 运行 Phase-2 校准报 `FileNotFoundError: frame/74225/img_00002.jpg`：该数据集帧文件名为 `000001.jpg`（6 位零填充、无前缀），默认模板 `img_{:05}.jpg` 不匹配。已在 ssv2 分支加 `FILENAME_TMPL='{:06}.jpg'`。
+- 全量校验: val 24777 个视频帧数与标注完全一致、无缺失目录（扫描通过）。
+
+**验证**:
+- `bash -n` 语法 ✅
+- k400 dry-run 参数与改动前逐项一致（回归通过）✅
+- ssv2 dry-run: SSV2/174 类/2×3/`--no_use_decord`/`--filename_tmpl {:06}.jpg`/motion 参数/量化模型路径全部正确 ✅
+- metadata 自动生成 ✅（`output_pth/SSv2/metadata/{train,val,test}.csv`）
+- GPU 评测: **待重跑**（filename_tmpl 修复后尚未跑完）
+
+**运行命令**（详见 `run_ptq.md` SSv2 一节）:
+```bash
+cd /data/liyifan24/VideoMamba/videomamba/video_sm
+
+CUDA_VISIBLE_DEVICES=2 \
+DATASET=ssv2 \
+BATCH_SIZE=32 \
+PTQ_CALIB_SIZE=32 \
+PTQ_CALIB_BATCH_SIZE=4 \
+QUANTIZED_MODEL_PATH=/data/liyifan24/VideoMamba/output_pth/SSv2/work1/run_motion_test.pth \
+SAVE_QUANTIZED=1 \
+EXPERIMENT=mixed-rank-motion \
+  nohup bash run_ptq_experiments.sh > /data/liyifan24/VideoMamba/output_pth/SSv2/work1/run_motion_test.log 2>&1 &
+```
+
 ---
 
 ## 实验脚本
@@ -245,6 +295,8 @@ motion 模式下 `ptq_payload['motion_in_proj_scales']` 存的是 CPU tensor（D
 | `quant/utils/motion_scale.py` | capture 子批次支持（2026-08-12） |
 | `videomamba/video_sm/run_class_finetuning_ptq.py` | `--ptq_calib_size/--ptq_calib_batch_size` + JSON 序列化修复 + 单卡 barrier 修复（2026-08-12） |
 | `videomamba/video_sm/run_ptq_experiments.sh` | `PTQ_CALIB_SIZE/PTQ_CALIB_BATCH_SIZE` + `QUANTIZED_MODEL_PATH`（2026-08-12） |
+| `videomamba/video_sm/run_ptq_experiments.sh` | `DATASET` 参数（k400/ssv2 分支）+ metadata 自动生成 + `--filename_tmpl`（2026-08-12 SSv2 适配） |
+| `run_ptq.md` | SSv2 运行说明（2026-08-12） |
 
 > 以上改动均在工作树中，**未 git commit**。
 
@@ -257,6 +309,7 @@ motion 模式下 `ptq_payload['motion_in_proj_scales']` 存的是 CPU tensor（D
 | `iter_calib_tensors` 单测（CPU） | 拆分/截断/不拆分/超量边界 7 项（2026-08-12） | ✅ 通过 |
 | 桩模型端到端校准（CPU） | 新路径/legacy/不拆分（2026-08-12） | ✅ 通过 |
 | motion capture 冒烟（CPU） | 新/旧路径捕获样本一致（2026-08-12） | ✅ 通过 |
+| SSv2 脚本 dry-run | k400 回归 + ssv2 参数展开 + bash -n（2026-08-12） | ✅ 通过 |
 
 ---
 
