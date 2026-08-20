@@ -161,8 +161,7 @@ videomamba/video_sm/logs
 # output_pt
 output_pth
 
-# Quamba
-quamba/
+# Quamba (local bridge files are tracked; upstream submodule stays ignored)
 quamba/Quamba/
 
 # PyCharm

@@ -7,6 +7,7 @@ set -euo pipefail
 # 用法:
 #   bash run_ptq_experiments.sh                      # 默认: mixed-rank-minmax, GPU 2
 #   EXPERIMENT=mixed-rank-motion bash run_ptq_experiments.sh
+#   EXPERIMENT=quamba-8 bash run_ptq_experiments.sh  # Quamba 风格均匀 8bit 权重量化
 #   EXPERIMENT=uniform-w4 bash run_ptq_experiments.sh
 #
 # 消融 (在实验预设基础上覆盖单个参数):
@@ -23,6 +24,7 @@ set -euo pipefail
 # 可用实验预设:
 #   uniform-w8             均匀 W8A16 基线
 #   uniform-w4             均匀 W4A16 基线
+#   quamba-8               Quamba 风格均匀 W8 (默认只跑 8bit)
 #   mixed-rank-minmax      混合精度 + rank 分配 + MinMax scale (步骤4)
 #   mixed-rank-motion      混合精度 + rank 分配 + 运动感知 scale (步骤4+5)
 #   mixed-threshold-minmax 混合精度 + threshold 分配 + MinMax scale (传统)
@@ -94,8 +96,6 @@ fi
 
 # ---- 通用参数 (均可通过环境变量覆盖) ----
 BATCH_SIZE=${BATCH_SIZE:-32}
-CALIB_SIZE=${PTQ_CALIB_SIZE:-128}
-CALIB_BATCH_SIZE=${PTQ_CALIB_BATCH_SIZE:-8}
 QUICK_BATCHES=${PTQ_QUICK_BATCHES:-50}
 NUM_GROUPS=${PTQ_NUM_GROUPS:-4}
 TAU_PERCENTILE=${PTQ_TAU_PERCENTILE:-85}
@@ -132,6 +132,9 @@ case "${EXPERIMENT}" in
   uniform-w4)
     E_QUANT='uniform';   E_UNIFORM_BIT=4; E_BIT_ALLOC='rank';      E_SCALE='minmax'; E_FRAC=0.5
     ;;
+  quamba-8)
+    E_QUANT='quamba';    E_UNIFORM_BIT=8; E_QUAMBA_BIT=8; E_QUAMBA_A_BITS=8; E_CALIB_SIZE=32; E_CALIB_BATCH_SIZE=4; E_BIT_ALLOC='rank'; E_SCALE='minmax'; E_FRAC=0.5
+    ;;
   mixed-rank-minmax)
     E_QUANT='mixed';    E_UNIFORM_BIT=4; E_BIT_ALLOC='rank';      E_SCALE='minmax'; E_FRAC=0.5
     ;;
@@ -143,7 +146,7 @@ case "${EXPERIMENT}" in
     ;;
   *)
     echo "ERROR: Unknown EXPERIMENT='${EXPERIMENT}'"
-    echo "Available: uniform-w8, uniform-w4, mixed-rank-minmax, mixed-rank-motion, mixed-threshold-minmax"
+    echo "Available: uniform-w8, uniform-w4, quamba-8, mixed-rank-minmax, mixed-rank-motion, mixed-threshold-minmax"
     exit 1
     ;;
 esac
@@ -154,6 +157,13 @@ UNIFORM_BIT=${PTQ_UNIFORM_BIT:-$E_UNIFORM_BIT}
 BIT_ALLOCATION_MODE=${PTQ_BIT_ALLOCATION_MODE:-$E_BIT_ALLOC}
 SCALE_MODE=${PTQ_SCALE_MODE:-$E_SCALE}
 HIGH_BLOCK_FRACTION=${PTQ_HIGH_BLOCK_FRACTION:-$E_FRAC}
+CALIB_SIZE=${PTQ_CALIB_SIZE:-${E_CALIB_SIZE:-128}}
+CALIB_BATCH_SIZE=${PTQ_CALIB_BATCH_SIZE:-${E_CALIB_BATCH_SIZE:-8}}
+
+# ---- Quamba 风格均匀权重量化参数 (步骤: Quamba 复现) ----
+QUAMBA_BIT=${PTQ_QUAMBA_BIT:-${E_QUAMBA_BIT:-8}}
+QUAMBA_A_BITS=${PTQ_QUAMBA_A_BITS:-${E_QUAMBA_A_BITS:-8}}
+QUAMBA_PERCENTILE_ALPHA=${PTQ_QUAMBA_PERCENTILE_ALPHA:-0.9995}
 
 # ---- 输出目录 ----
 JOB_NAME="ptq_${EXPERIMENT}${JOB_SUFFIX_DEFAULT}"
@@ -181,6 +191,11 @@ echo "  BIT_ALLOC_MODE    : ${BIT_ALLOCATION_MODE}"
 echo "  HIGH_BLOCK_FRAC   : ${HIGH_BLOCK_FRACTION}"
 if [ "${QUANT_METHOD}" = "uniform" ]; then
   echo "  UNIFORM_BIT       : ${UNIFORM_BIT}"
+fi
+if [ "${QUANT_METHOD}" = "quamba" ]; then
+  echo "  QUAMBA_BIT        : ${QUAMBA_BIT}"
+  echo "  QUAMBA_A_BITS     : ${QUAMBA_A_BITS}"
+  echo "  QUAMBA_PCT_ALPHA  : ${QUAMBA_PERCENTILE_ALPHA}"
 fi
 echo "  CALIB_SIZE        : ${CALIB_SIZE} samples"
 echo "  CALIB_SUB_BATCH   : ${CALIB_BATCH_SIZE} (0=no split)"
@@ -226,6 +241,14 @@ PTQ_ARGS=(
 
 if [ "${QUANT_METHOD}" = "uniform" ]; then
   PTQ_ARGS+=(--ptq_uniform_bit "${UNIFORM_BIT}")
+fi
+
+if [ "${QUANT_METHOD}" = "quamba" ]; then
+  PTQ_ARGS+=(
+    --quamba_default_bit "${QUAMBA_BIT}"
+    --quamba_a_bits "${QUAMBA_A_BITS}"
+    --quamba_percentile_alpha "${QUAMBA_PERCENTILE_ALPHA}"
+  )
 fi
 
 if [ "${SCALE_MODE}" = "motion" ]; then

@@ -39,7 +39,15 @@ from quant.utils import (
     capture_in_proj_activations,
     compute_motion_aware_in_proj_scales,
     export_real_weight_only_checkpoint,
+    export_quantized_mamba_checkpoint,
     quick_eval_allocate_block_bits,
+)
+
+from quant.quamba import (
+    QuambaCalibrationResult,
+    apply_quamba_ptq,
+    build_uniform_block_bits as build_quamba_uniform_block_bits,
+    run_quamba_calibration,
 )
 
 
@@ -233,8 +241,9 @@ def get_args():
     # PTQ parameters
     parser.add_argument('--ptq_enable', action='store_true', default=False,
                         help='Enable VideoMamba PTQ pipeline in eval mode')
-    parser.add_argument('--quant_method', type=str, default='mixed', choices=['mixed', 'uniform'],
-                        help='Quantization method in eval PTQ: mixed (score-based) or uniform (global single bit)')
+    parser.add_argument('--quant_method', type=str, default='mixed', choices=['mixed', 'uniform', 'quamba'],
+                        help='Quantization method in eval PTQ: mixed (score-based), uniform (global single bit), '
+                             'or quamba (Quamba-style uniform weight PTQ)')
     parser.add_argument('--ptq_uniform_bit', type=int, default=8, choices=[4, 8],
                         help='Uniform global bit for quant_method=uniform')
     parser.add_argument('--ptq_calib_size', type=int, default=None,
@@ -273,6 +282,14 @@ def get_args():
                         help='Save integer-form quantized checkpoint after full eval inference')
     parser.add_argument('--ptq_quantized_model_path', type=str, default='',
                         help='Output path for integer quantized checkpoint (.pth). If empty, save under output_dir')
+
+    # ---- Quamba-style uniform weight PTQ ----
+    parser.add_argument('--quamba_default_bit', type=int, default=8, choices=[4, 8],
+                        help='Uniform bit width used by Quamba weight PTQ backend')
+    parser.add_argument('--quamba_a_bits', type=int, default=8, choices=[8, 16],
+                        help='Activation calibration bit width for Quamba backend')
+    parser.add_argument('--quamba_percentile_alpha', type=float, default=0.9995,
+                        help='Percentile alpha used by Quamba bridge calibration observers')
 
     # ---- Step-5: motion-aware per-output-channel scale optimization ----
     parser.add_argument('--ptq_scale_mode', type=str, default='minmax',
@@ -798,6 +815,47 @@ def main(args, ds_init):
                         ptq_payload['motion_in_proj_scales'] = {
                             k: v for k, v in motion_scales.items()
                         }
+            elif quant_method == 'quamba':
+                export_default_bit = int(args.quamba_default_bit)
+                if global_rank == 0:
+                    calib_loader = data_loader_val if data_loader_val is not None else data_loader_test
+                    loader_bs = max(int(args.batch_size), 1)
+                    if args.ptq_calib_size is not None and args.ptq_calib_size > 0:
+                        calib_size = int(args.ptq_calib_size)
+                        calib_batches = None
+                    elif args.ptq_calib_batches is not None and args.ptq_calib_batches > 0:
+                        calib_size = int(args.ptq_calib_batches) * loader_bs
+                        calib_batches = int(args.ptq_calib_batches)
+                    else:
+                        calib_size = 16 * loader_bs
+                        calib_batches = 16
+                    calib_bs = args.ptq_calib_batch_size if (args.ptq_calib_batch_size or 0) > 0 else None
+                    print(f'[PTQ][quamba] Calibration: calib_size={calib_size} samples, '
+                          f'calib_batch_size={calib_bs if calib_bs else loader_bs} '
+                          f'(loader batch={loader_bs}), a_bits={args.quamba_a_bits}, '
+                          f'default_bit={args.quamba_default_bit}')
+                    quamba_calibration = run_quamba_calibration(
+                        model=model_without_ddp,
+                        calib_loader=calib_loader,
+                        device=device,
+                        max_calib_batches=calib_batches if calib_batches is not None else 16,
+                        calib_size=calib_size,
+                        calib_batch_size=calib_bs,
+                        a_bits=args.quamba_a_bits,
+                        percentile_alpha=args.quamba_percentile_alpha,
+                    )
+
+                    ptq_payload['block_bits'] = build_quamba_uniform_block_bits(
+                        model=model_without_ddp,
+                        default_bit=args.quamba_default_bit,
+                    )
+                    ptq_payload['block_high_ratio'] = {
+                        int(k): 0.0 for k in ptq_payload['block_bits'].keys()
+                    }
+                    ptq_payload['block_stats'] = {
+                        int(k): dict(v) for k, v in quamba_calibration.block_stats.items()
+                    }
+                    print(f"[PTQ][quamba] block_bits = {ptq_payload['block_bits']}")
             elif quant_method == 'uniform':
                 export_default_bit = int(args.ptq_uniform_bit)
                 if global_rank == 0:
@@ -815,7 +873,21 @@ def main(args, ds_init):
                 ptq_payload = payload_list[0]
 
             print(f"[PTQ] block_bits = {ptq_payload['block_bits']}")
-            if quant_method == 'uniform':
+            replace_summary = None
+            if quant_method == 'quamba':
+                quamba_calibration = QuambaCalibrationResult(
+                    act_scales={},
+                    block_stats={int(k): dict(v) for k, v in ptq_payload['block_stats'].items()},
+                )
+                ptq_session = apply_quamba_ptq(
+                    model=model_without_ddp,
+                    block_bits=ptq_payload['block_bits'],
+                    default_bit=args.quamba_default_bit,
+                    calibration=quamba_calibration,
+                )
+                print(f"[PTQ][quamba] Fake-quantized {len(ptq_session.weight_backup)} tensors "
+                      f"at {args.quamba_default_bit}-bit")
+            elif quant_method == 'uniform':
                 uniform_apply = apply_uniform_global_weight_only(
                     model=model_without_ddp,
                     bit=export_default_bit,
@@ -845,7 +917,8 @@ def main(args, ds_init):
                         default_bit=export_default_bit,
                         pack_int4=True,
                     )
-            print(f"[PTQ] Replaced quantized projections: {replace_summary['num_replaced']}, by_bit={replace_summary['by_bit']}")
+            if replace_summary is not None:
+                print(f"[PTQ] Replaced quantized projections: {replace_summary['num_replaced']}, by_bit={replace_summary['by_bit']}")
 
             if global_rank == 0 and args.output_dir:
                 os.makedirs(args.output_dir, exist_ok=True)
@@ -868,14 +941,24 @@ def main(args, ds_init):
                     os.makedirs(args.output_dir, exist_ok=True)
                     quantized_save_path = os.path.join(args.output_dir, 'ptq_quantized_model_real_wonly.pth')
 
-                _ = export_real_weight_only_checkpoint(
-                    model=model_without_ddp,
-                    block_bits=ptq_payload['block_bits'],
-                    save_path=quantized_save_path,
-                    default_bit=export_default_bit,
-                    include_non_quantized_state=True,
-                )
-                print(f"[PTQ] Saved real weight-only quantized checkpoint to: {quantized_save_path}")
+                if quant_method == 'quamba':
+                    _ = export_quantized_mamba_checkpoint(
+                        model=model_without_ddp,
+                        block_bits=ptq_payload['block_bits'],
+                        save_path=quantized_save_path,
+                        default_bit=args.quamba_default_bit,
+                        include_non_quantized_state=True,
+                    )
+                    print(f"[PTQ] Saved Quamba integer checkpoint to: {quantized_save_path}")
+                else:
+                    _ = export_real_weight_only_checkpoint(
+                        model=model_without_ddp,
+                        block_bits=ptq_payload['block_bits'],
+                        save_path=quantized_save_path,
+                        default_bit=export_default_bit,
+                        include_non_quantized_state=True,
+                    )
+                    print(f"[PTQ] Saved real weight-only quantized checkpoint to: {quantized_save_path}")
 
             if args.distributed:
                 torch.distributed.barrier()
