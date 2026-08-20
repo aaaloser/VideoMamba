@@ -162,7 +162,7 @@ videomamba/video_sm/logs
 output_pth
 
 # Quamba (local bridge files are tracked; upstream submodule stays ignored)
-# quamba/Quamba/
+quamba/Quamba/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
